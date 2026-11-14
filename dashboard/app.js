@@ -1,164 +1,163 @@
-// Token Launch Radar — dashboard app (no network; data comes from ../data.js).
+// Token Launch Radar — dashboard app. Renders window.TOKEN_RADAR (data.js).
+// No network: every byte the page needs is in the board it ships with.
+
 (function () {
   'use strict';
-  var D = window.TOKEN_RADAR;
-  if (!D || !D.rows) {
-    document.getElementById('meta').textContent = 'Data not loaded.';
-    return;
-  }
-  var rows = D.rows;
+  var DATA = window.TOKEN_RADAR;
+  if (!DATA) return;
+  var rows = DATA.rows;
+  var stats = DATA.stats;
 
-  function money(n) {
-    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
-    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
-    if (n >= 1e3) return '$' + (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
-    return '$' + Math.trunc(n);
+  function fmtUsd(n) {
+    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return '$' + (n / 1e3).toFixed(0) + 'K';
+    return '$' + n;
   }
-  function moneyFull(n) {
-    return '$' + String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  }
-  function pct(v) {
-    if (v === null || v === undefined) return { t: '—', c: 'flat' };
-    var s = (v > 0 ? '+' : '') + v.toFixed(1) + '%';
-    return { t: s, c: v > 0 ? 'up' : v < 0 ? 'down' : 'flat' };
+  function fmtPct(x) {
+    if (x === null || x === undefined) return '—';
+    var s = (x > 0 ? '+' : '') + x.toFixed(1) + '%';
+    return s;
   }
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  // ---- meta + multiples -------------------------------------------------
-  var wl = rows.filter(function (r) { return r.is_watchlist; }).length;
-  document.getElementById('meta').innerHTML =
-    '<b>' + rows.length + '</b> protocols &nbsp;·&nbsp; <b>' + wl + '</b> watchlist<br>' +
-    'Snapshot ' + esc(D.as_of) + ' &nbsp;·&nbsp; global multiple <b>' + D.global_multiple.toFixed(2) + '×</b>';
-  var mults = Object.keys(D.category_multiples).map(function (c) {
-    return [c, D.category_multiples[c]];
-  }).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 8);
-  document.getElementById('multiples').innerHTML =
-    '<strong>Category multiples in this board (median mcap/TVL of tokenized peers, shrunk):</strong> ' +
-    mults.map(function (m) { return esc(m[0]) + ' <b>' + m[1].toFixed(2) + '×</b>'; }).join(' &nbsp;·&nbsp; ');
+  // ---- stats bar
+  var statsEl = document.getElementById('stats');
+  var statItems = [
+    ['Protocols', String(rows.length)],
+    ['Watchlist', stats.watchlist_covered + ' / ' + stats.watchlist],
+    ['Total implied', fmtUsd(stats.total_implied_usd)],
+    ['Snapshot', stats.as_of],
+  ];
+  statsEl.innerHTML = statItems.map(function (kv) {
+    return '<div><dt>' + esc(kv[0]) + '</dt><dd>' + esc(kv[1]) + '</dd></div>';
+  }).join('');
 
-  // ---- filter controls --------------------------------------------------
-  var cats = [], chains = [];
-  rows.forEach(function (r) {
-    if (cats.indexOf(r.category) < 0) cats.push(r.category);
-    r.chains.forEach(function (c) { if (chains.indexOf(c) < 0) chains.push(c); });
-  });
-  cats.sort(); chains.sort();
-  var catSel = document.getElementById('cat');
+  // ---- category dropdown
+  var cats = [];
+  rows.forEach(function (r) { if (r.category && cats.indexOf(r.category) === -1) cats.push(r.category); });
+  cats.sort();
+  var catSel = document.getElementById('category');
   cats.forEach(function (c) {
-    var o = document.createElement('option'); o.value = c; o.textContent = c; catSel.appendChild(o);
-  });
-  var chainSel = document.getElementById('chain');
-  chains.forEach(function (c) {
-    var o = document.createElement('option'); o.value = c; o.textContent = c; chainSel.appendChild(o);
+    var o = document.createElement('option');
+    o.value = c; o.textContent = c;
+    catSel.appendChild(o);
   });
 
-  var q = document.getElementById('q');
-  var sortSel = document.getElementById('sort');
-  var wlBox = document.getElementById('wl');
+  // ---- filters (also readable from the URL: ?filter=watchlist, ?category=X, ?q=text, #slug=...)
+  var params = new URLSearchParams(window.location.search);
+  var state = {
+    filter: params.get('filter') || 'all',
+    category: params.get('category') || '',
+    q: params.get('q') || '',
+    slug: (window.location.hash.match(/slug=([^&]+)/) || [])[1] || null,
+  };
+  var filterBtns = document.querySelectorAll('.filter-btn');
+  function syncFilterButtons() {
+    filterBtns.forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-filter') === state.filter); });
+  }
+  if (state.category) catSel.value = state.category;
+  var searchEl = document.getElementById('search');
+  if (state.q) searchEl.value = state.q;
+  syncFilterButtons();
+
+  document.getElementById('count-all').textContent = '(' + rows.length + ')';
+  document.getElementById('count-watchlist').textContent = '(' + stats.watchlist_covered + ')';
+
   var tbody = document.getElementById('rows');
-  var countEl = document.getElementById('count');
-  var emptyEl = document.getElementById('empty');
-  var detailEl = document.getElementById('detail');
-  var layoutEl = document.getElementById('layout');
-  var selected = null;
+  var shownEl = document.getElementById('shown');
+  var layout = document.querySelector('.layout');
+  var detail = document.getElementById('detail');
+  var detailBody = document.getElementById('detail-body');
 
-  function currentRows() {
-    var needle = q.value.trim().toLowerCase();
-    var list = rows.filter(function (r) {
-      if (wlBox.checked && !r.is_watchlist) return false;
-      if (catSel.value && r.category !== catSel.value) return false;
-      if (chainSel.value && r.chains.indexOf(chainSel.value) < 0) return false;
-      if (needle && (r.name.toLowerCase().indexOf(needle) < 0 && r.slug.indexOf(needle) < 0)) return false;
+  function visibleRows() {
+    var q = state.q.trim().toLowerCase();
+    return rows.filter(function (r) {
+      if (state.filter === 'watchlist' && !r.watchlist) return false;
+      if (state.category && r.category !== state.category) return false;
+      if (q && r.name.toLowerCase().indexOf(q) === -1 && r.slug.toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
-    var s = sortSel.value;
-    if (s === 'tvl') list.sort(function (a, b) { return b.tvl_usd - a.tvl_usd; });
-    else if (s === 'growth') list.sort(function (a, b) { return (b.change_7d || 0) - (a.change_7d || 0); });
-    else if (s === 'name') list.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-    else list.sort(function (a, b) { return a.rank - b.rank; });
-    return list;
+  }
+
+  function chainChips(r) {
+    var chips = r.chains.slice(0, 4).map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('');
+    if (r.chains.length > 4) chips += '<span class="chip more">+' + (r.chains.length - 4) + '</span>';
+    return '<span class="chips">' + chips + '</span>';
   }
 
   function render() {
-    var list = currentRows();
-    countEl.textContent = list.length + ' of ' + rows.length + ' shown';
-    emptyEl.hidden = list.length > 0;
-    var html = '';
-    list.forEach(function (r) {
-      var g = pct(r.change_7d);
-      html += '<tr data-slug="' + esc(r.slug) + '"' + (selected === r.slug ? ' class="sel"' : '') + '>' +
-        '<td class="r">' + r.rank + '</td>' +
-        '<td><span class="name">' + esc(r.name) + '</span>' +
-        (r.is_watchlist ? '<span class="badge">Watchlist</span>' : '') +
-        '<br><span class="slug">' + esc(r.slug) + '</span></td>' +
-        '<td class="cat">' + esc(r.category) + '</td>' +
-        '<td>' + r.chains.slice(0, 3).map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('') +
-        (r.chains.length > 3 ? '<span class="chip">+' + (r.chains.length - 3) + '</span>' : '') + '</td>' +
-        '<td class="r">' + money(r.tvl_usd) + '</td>' +
-        '<td class="r ' + g.c + '">' + g.t + '</td>' +
-        '<td class="r val">' + money(r.implied_value_usd) + '</td></tr>';
-    });
+    var list = visibleRows();
+    var html = list.map(function (r) {
+      var chg = r.change_7d === null ? '<span>—</span>' : '<span class="' + (r.change_7d >= 0 ? 'up' : 'down') + '">' + fmtPct(r.change_7d) + '</span>';
+      return '<tr data-slug="' + esc(r.slug) + '">' +
+        '<td class="rank">' + r.rank + '</td>' +
+        '<td class="proto"><span class="name">' + esc(r.name) + '</span>' + (r.watchlist ? '<span class="badge">Watchlist</span>' : '') + '<br><span class="slug">' + esc(r.slug) + '</span></td>' +
+        '<td class="cat">' + esc(r.category || '—') + '</td>' +
+        '<td class="chains">' + chainChips(r) + '</td>' +
+        '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
+        '<td class="num">' + chg + '</td>' +
+        '<td class="num"><span class="val">' + fmtUsd(r.implied_value_usd) + '</span></td>' +
+        '</tr>';
+    }).join('');
     tbody.innerHTML = html;
-    tbody.querySelectorAll('tr').forEach(function (tr) {
-      tr.addEventListener('click', function () { select(tr.getAttribute('data-slug'), true); });
-    });
+    shownEl.textContent = 'Showing ' + list.length + ' of ' + rows.length + ' protocols' +
+      (state.filter === 'watchlist' ? ' — watchlist only' : '') +
+      (state.category ? ' — ' + state.category : '') + '.';
   }
 
-  function select(slug, scroll) {
+  function openDetail(slug) {
     var r = null;
     rows.forEach(function (x) { if (x.slug === slug) r = x; });
     if (!r) return;
-    selected = slug;
-    var b = r.value_breakdown;
-    var g = pct(r.change_7d);
-    detailEl.innerHTML =
-      '<button class="close" id="dclose">Close</button>' +
+    var peers = (stats.category_peers && stats.category_peers[r.category] !== undefined) ? stats.category_peers[r.category] : null;
+    var multLabel = 'Category multiple (' + (r.category || '—') + (peers === null ? ', no tokenized peer' : ', ' + peers + ' peer' + (peers === 1 ? '' : 's')) + ')';
+    var breakdown = [
+      ['TVL', fmtUsd(r.tvl_usd)],
+      [multLabel, '×' + r.category_multiple.toFixed(2)],
+      ['Growth (7d ' + fmtPct(r.change_7d) + ')', '×' + r.growth_factor.toFixed(2)],
+      ['Maturity' + (r.listed_at ? ' (since ' + r.listed_at + ')' : ''), '×' + r.maturity_factor.toFixed(2)],
+      ['Breadth (' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + ')', '×' + r.breadth_factor.toFixed(2)],
+    ];
+    var steps = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+    detailBody.innerHTML =
       '<h2>' + esc(r.name) + '</h2>' +
-      '<p class="dsub">Rank #' + r.rank + ' &nbsp;·&nbsp; ' + esc(r.slug) + ' &nbsp;·&nbsp; ' + esc(r.category) +
-      (r.is_watchlist ? ' &nbsp;·&nbsp; <span class="badge">Watchlist</span>' : '') + '</p>' +
-      '<div class="big">' + money(r.implied_value_usd) + '</div>' +
-      '<p class="dsub">implied launch value</p>' +
-      '<h3>How the value is built</h3><dl>' +
-      '<dt>TVL</dt><dd>' + moneyFull(r.tvl_usd) + '</dd>' +
-      '<dt>Category multiple</dt><dd>' + b.multiple.toFixed(3) + '× (' + esc(r.category) + ')</dd>' +
-      '<dt>7-day growth</dt><dd class="' + g.c + '">' + g.t + ' → ×' + b.growth_factor.toFixed(3) + '</dd>' +
-      '<dt>Running with no token</dt><dd>' + b.age_years.toFixed(1) + ' yrs → ×' + b.maturity_factor.toFixed(3) + '</dd>' +
-      '<dt>Chains</dt><dd>' + r.chains.length + ' → ×' + b.breadth_factor.toFixed(3) + '</dd>' +
-      '<dt>Listed</dt><dd>' + esc(r.listed_at || '—') + '</dd>' +
-      '</dl>' +
-      '<h3>Farm plan — ' + esc(r.name) + '</h3><ol>' +
-      r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') +
-      '</ol>';
-    detailEl.hidden = false;
-    layoutEl.classList.add('split');
-    document.getElementById('dclose').addEventListener('click', function () {
-      selected = null; detailEl.hidden = true; layoutEl.classList.remove('split'); render();
-    });
-    render();
-    if (scroll) detailEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      '<p class="dslug">' + esc(r.slug) + ' · Rank #' + r.rank + (r.watchlist ? ' · <span class="badge">Watchlist</span>' : '') + '</p>' +
+      '<div class="dval-label">Implied value</div><div class="dval">' + fmtUsd(r.implied_value_usd) + '</div>' +
+      '<h3>How the value is built</h3>' +
+      '<table class="breakdown"><tbody>' +
+      breakdown.map(function (kv) { return '<tr><td>' + esc(kv[0]) + '</td><td>' + esc(kv[1]) + '</td></tr>'; }).join('') +
+      '<tr class="total"><td>Implied value</td><td>' + fmtUsd(r.implied_value_usd) + '</td></tr>' +
+      '</tbody></table>' +
+      '<p class="meta">Category: ' + esc(r.category || '—') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + (r.listed_at ? ' · tracked since ' + r.listed_at : '') + '</p>' +
+      '<h3>Farm plan — 6 steps</h3>' +
+      '<ol class="farm">' + steps + '</ol>';
+    detail.hidden = false;
+    layout.classList.add('detail-open');
+    var tr = tbody.querySelector('tr[data-slug="' + r.slug.replace(/"/g, '') + '"]');
+    tbody.querySelectorAll('tr.selected').forEach(function (t) { t.classList.remove('selected'); });
+    if (tr) tr.classList.add('selected');
   }
 
-  [q, catSel, chainSel, sortSel, wlBox].forEach(function (el) {
-    el.addEventListener('input', render);
-    el.addEventListener('change', render);
+  function closeDetail() {
+    detail.hidden = true;
+    layout.classList.remove('detail-open');
+    tbody.querySelectorAll('tr.selected').forEach(function (t) { t.classList.remove('selected'); });
+  }
+
+  tbody.addEventListener('click', function (e) {
+    var tr = e.target.closest('tr[data-slug]');
+    if (tr) openDetail(tr.getAttribute('data-slug'));
   });
-
-  // ---- hash routing: #detail=<slug> and/or #filter=<category> -----------
-  function fromHash() {
-    var h = window.location.hash.replace(/^#/, '');
-    if (!h) return;
-    var p = new URLSearchParams(h);
-    if (p.get('filter')) {
-      var f = p.get('filter');
-      if (cats.indexOf(f) >= 0) { catSel.value = f; }
-    }
-    if (p.get('q')) q.value = p.get('q');
-    render();
-    if (p.get('detail')) select(p.get('detail'), false);
-  }
+  document.getElementById('close-detail').addEventListener('click', closeDetail);
+  filterBtns.forEach(function (b) {
+    b.addEventListener('click', function () { state.filter = b.getAttribute('data-filter'); syncFilterButtons(); render(); });
+  });
+  catSel.addEventListener('change', function () { state.category = catSel.value; render(); });
+  searchEl.addEventListener('input', function () { state.q = searchEl.value; render(); });
 
   render();
-  fromHash();
+  if (state.slug) openDetail(decodeURIComponent(state.slug));
 })();

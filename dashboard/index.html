@@ -1,59 +1,74 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Launch Radar — pre-token protocols ranked by implied launch value</title>
+<title>Token Launch Radar — pre-token protocols, ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header class="top">
-  <div>
+  <div class="title-block">
     <h1>Token Launch Radar</h1>
-    <p class="sub">Every protocol in the snapshot that records no token, ranked by what its launch would be worth — and how to farm each one.</p>
+    <p class="sub">Which pre-token protocol is worth farming next, and what to do about it. Ranked by an implied value the model states, not by TVL alone.</p>
   </div>
-  <div class="meta" id="meta">Loading…</div>
+  <dl class="stats" id="stats"></dl>
 </header>
 
 <section class="method">
-  <h2>How the ranking works</h2>
-  <p><strong>Implied value = TVL × category multiple × growth × maturity × breadth.</strong>
-  The <em>category multiple</em> is the median market-cap / TVL ratio of the tokenized protocols in the same category — each ratio winsorized to [0.005, 5], shrunk toward the global median with a prior weight of 3, clipped to [0.03, 1.5]. Categories with no tokenized peer use the global median. <em>Growth</em> is the 7-day TVL change, dampened (60% weight, clamped to −25%…+50%). <em>Maturity</em> is 4% a year, capped at 3 years: a long-running, large protocol with no token yet is the launch the market has waited longest for. <em>Breadth</em> is the chain count, log-scaled. The multiple is read off the snapshot itself, never a hardcoded list of names.</p>
-  <p id="multiples"></p>
-  <p class="note">“Records no token” means DefiLlama records none for the protocol — it is the record, not proof. Wrapped, staked and bridged products of tokens that already trade are left out. An implied value is this radar’s own claim, never a prediction that a token will launch, or when, or at what price.</p>
+  <p class="method-line"><strong>Implied value = TVL &times; category multiple &times; growth &times; maturity &times; breadth</strong> — calibrated on the tokenized peers in each category. The global median is 0.17&times;, dragged down by many small tokenized protocols; each category multiple reflects that category&rsquo;s larger, more comparable peers.</p>
+  <details class="method-details">
+    <summary>How the ranking works</summary>
+    <div class="method-body">
+      <p><strong>Category multiple.</strong> For each category, the median market-cap-to-TVL ratio of its tokenized protocols (winsorized to 0.005&ndash;5), shrunk toward the global median of 0.17&times; with a prior weight of 3, clipped to 0.03&ndash;1.5. A category with no tokenized peer falls back to the global median. Risk Curators read 0.87&times; on a single peer; Lending reads 0.14&times; on fifteen.</p>
+      <p><strong>Growth.</strong> The 7-day TVL change at 60% weight, clamped to &minus;25%..+50%. A protocol growing fast earns more than a flat one at the same TVL.</p>
+      <p><strong>Maturity.</strong> 4% a year, capped at 3 years, from the day DefiLlama began tracking the protocol. Older protocols have had longer to earn trust.</p>
+      <p><strong>Breadth.</strong> The chain count, log-scaled, capped at &times;1.08. A protocol live on many chains is worth a little more than one on a single chain.</p>
+      <p><strong>The board.</strong> Every protocol DefiLlama records no token for (and that is not a wrapped, staked or bridged product of a token that already trades). The watchlist is the 40 of them at or above $50M TVL; the board adds every pre-token protocol below the floor, so it is the whole launch universe, not just the floor.</p>
+      <p><strong>The farm plan.</strong> Six steps per protocol, written for its category: how to enter, the core action, how to size it, what keeps it eligible, the weekly rhythm, and what to track. Steps bend with the protocol&rsquo;s own 7-day change and with watchlist status.</p>
+    </div>
+  </details>
 </section>
 
 <section class="controls">
-  <input id="q" type="search" placeholder="Search a protocol…" aria-label="Search">
-  <select id="cat" aria-label="Category"><option value="">All categories</option></select>
-  <select id="chain" aria-label="Chain"><option value="">All chains</option></select>
-  <select id="sort" aria-label="Sort">
-    <option value="value">Sort: implied value</option>
-    <option value="tvl">Sort: TVL</option>
-    <option value="growth">Sort: 7-day growth</option>
-    <option value="name">Sort: name</option>
+  <div class="filters" role="group" aria-label="Filter">
+    <button class="filter-btn active" data-filter="all">All <span class="count" id="count-all"></span></button>
+    <button class="filter-btn" data-filter="watchlist">Watchlist only <span class="count" id="count-watchlist"></span></button>
+  </div>
+  <select id="category" aria-label="Category">
+    <option value="">All categories</option>
   </select>
-  <label class="wl"><input type="checkbox" id="wl"> Watchlist only</label>
-  <span id="count"></span>
+  <input id="search" type="search" placeholder="Search name or slug&hellip;" aria-label="Search">
 </section>
 
-<main id="layout">
-  <div class="board-wrap">
+<main class="layout">
+  <div class="table-wrap">
     <table id="board">
-      <thead><tr>
-        <th class="r">#</th><th>Protocol</th><th>Category</th><th>Chains</th>
-        <th class="r">TVL</th><th class="r">7d</th><th class="r">Implied value</th>
-      </tr></thead>
+      <thead>
+        <tr>
+          <th class="rank">#</th>
+          <th class="proto">Protocol</th>
+          <th class="cat">Category</th>
+          <th class="chains">Chains</th>
+          <th class="num">TVL</th>
+          <th class="num">7d</th>
+          <th class="num">Implied value</th>
+        </tr>
+      </thead>
       <tbody id="rows"></tbody>
     </table>
-    <p class="empty" id="empty" hidden>No protocol matches this filter.</p>
+    <p class="foot" id="shown"></p>
   </div>
-  <aside id="detail" hidden></aside>
+  <aside class="detail" id="detail" hidden>
+    <button class="close" id="close-detail" aria-label="Close detail">&times;</button>
+    <div id="detail-body"></div>
+  </aside>
 </main>
 
-<footer>
-  <p>Source: DefiLlama protocols snapshot, fetched once for this competition (see board.json). The board covers all 40 watchlist protocols plus every other eligible pre-token protocol below the floor. Data is local; this page makes no network request.</p>
+<footer class="foot-note">
+  <p>Data: DefiLlama protocol snapshot, sealed 2026-11-14. A protocol is listed as pre-token when DefiLlama records no token for it; that is the record, not proof it has none. Implied value is this radar&rsquo;s own claim, never a promise of a launch or a price.</p>
 </footer>
+
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
