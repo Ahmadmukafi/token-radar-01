@@ -1,35 +1,32 @@
-// Token Launch Radar — round 3.
-// Reads a sealed DefiLlama protocol snapshot and ranks the protocols whose
-// token does not exist yet by the implied value of a token they may one day
-// issue, with a concrete farm plan for each one.
+// token-radar-01 round 4 — Token launch radar.
+// Reads the sealed DefiLlama snapshot, ranks every genuine launch candidate
+// (a protocol that records no token and is not a wrapped, staked, bridged,
+// versioned or exchange product) by an implied token value, and writes the
+// board, the dashboard data, and the dossier.
 //
-// Value model (every number comes from the snapshot itself; nothing is
-// hardcoded by name):
-//   implied = TVL x categoryMultiple x growth x maturity x breadth
-//   categoryMultiple: the median market-cap / TVL of the token-bearing
-//     protocols in the same category (each protocol's ratio winsorized at
-//     3x so one tiny-TVL token cannot set a category), shrunk toward the
-//     global median with a prior weight of 3, clamped to [0.05, 1.50].
-//     A category with no token-bearing protocol uses the global median.
-//     One snapshot record carries a market cap of -1 (a data quirk); the
-//     model only counts strictly positive market caps and TVLs, so that
-//     record cannot move any multiple.
-//   growth:   1 + change_7d / 200, clamped to [0.70, 1.30] (no report: 1).
-//   maturity: 1 + 0.4 x min(ageDays, 730) / 730 (no listed date: 1).
-//   breadth:  1 + 0.02 x min(chains - 1, 15).
-// The board ranks only launch candidates: protocols that record no token
-// AND are not a wrapped, staked or bridged product of a token that already
-// trades, not a centralised exchange, not a versioned copy (name ending in
-// V2 / v2 / 2.0), and not named after an exchange. That is the house's own
-// watchlist rule, applied as the board's filter instead of its floor: the
-// 40 watchlist protocols are all in the board, and 158 more candidates
-// below the $50M floor join them. Protocols whose token already trades
-// (416) and wrapped/staked/bridged products (144) are not ranked, because
-// there is no launch left to value; the dashboard says so in plain text.
-
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+// The value model, in one line:
+//   implied = TVL x category multiple x growth x maturity x breadth x confidence
+//
+// The category multiple is the median mcap/TVL of the token-bearing
+// protocols in that category, winsorized at 3x, then shrunk toward the
+// global median with a prior weight of 5. The shrinkage is the point: a
+// category with one observation (Risk Curators: a single 2.975x print)
+// cannot set the multiple on its own — it is pulled most of the way to
+// the global median, and the confidence discount says so openly. Every
+// multiple carries its observation count and a confidence badge
+// (high n>=5, medium 2-4, low 1, none 0) so the reader sees exactly how
+// much evidence each number rests on.
+//
+//   growth     = 1 + clamp(change_7d / 100, -0.30, +0.30); 1.00 when unreported
+//   maturity   = 0.85 + 0.15 * min(age_years / 3, 1); 0.925 when unlisted
+//   breadth    = 1 + 0.05 * min(chains - 1, 4)
+//   confidence = 1.00 high, 0.97 medium, 0.92 low, 0.88 none
+//   multiple   = clamp(shrunk median, 0.05, 1.50)
+//
+// Deterministic: no clock, no randomness. Ages are measured against the
+// snapshot's own as_of date. Ties break by TVL desc, then slug asc.
+import { readFileSync, writeFileSync, mkdirSync, cpSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 interface Protocol {
@@ -53,311 +50,380 @@ interface Snapshot {
   watchlist: string[];
 }
 
+interface FactorSet {
+  multiple: number;
+  growth: number;
+  maturity: number;
+  breadth: number;
+  confidence: number;
+  confidenceLabel: 'high' | 'medium' | 'low' | 'none';
+  catObs: number;
+  catMedian: number | null;
+}
+
 interface Row {
   slug: string;
   name: string;
   rank: number;
   implied_value_usd: number;
   farm_steps: string[];
-  category: string;
+  category: string | null;
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
-  age_days: number | null;
-  category_multiple: number;
-  growth_factor: number;
-  maturity_factor: number;
-  breadth_factor: number;
+  listed_at: string | null;
   watchlist: boolean;
+  factors: FactorSet;
 }
 
-const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
+const VERSION_RE = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+const EXCLUDED_CATEGORIES = new Set([
+  'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX',
+]);
+const EXCHANGE_PREFIXES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
+const PRIOR_WEIGHT = 5;
+const GLOBAL_FALLBACK = 0.2049; // replaced at runtime by the measured global median
+const WINSOR = 3.0;
+const MULT_MIN = 0.05;
+const MULT_MAX = 1.5;
 
-function median(nums: number[]): number {
-  const s = [...nums].sort((a, b) => a - b);
+function clamp(x: number, lo: number, hi: number): number {
+  return x < lo ? lo : x > hi ? hi : x;
+}
+
+function median(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
   const n = s.length;
-  if (n === 0) return 0;
-  return n % 2 === 1 ? s[(n - 1) / 2]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
+  if (n === 0) return NaN;
+  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
 }
 
-function parseArgs(): { input: string; output: string } {
-  const argv = process.argv.slice(2);
-  let input = '/input/snapshot.json';
+/** The house's own exclusion rule, reimplemented: a version marker, an
+ *  excluded category, a whole word wrapped/staked/staking, or an exchange
+ *  name at the start of the name. */
+function excludedByHouseRule(p: Protocol): string | null {
+  if (VERSION_RE.test(p.name)) return 'version marker';
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return 'category ' + p.category;
+  const words = p.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (words.includes('wrapped') || words.includes('staked') || words.includes('staking')) {
+    return 'wrapped/staked word';
+  }
+  if (EXCHANGE_PREFIXES.some((e) => p.name.startsWith(e))) return 'exchange name';
+  return null;
+}
+
+function gasNote(chain: string): string {
+  switch (chain) {
+    case 'Ethereum': return 'about $4–$12 a transaction on Ethereum mainnet';
+    case 'Solana': return 'about $0.01 a transaction on Solana';
+    case 'Tron': return 'about $1–$2 a transaction on Tron';
+    case 'Bitcoin': return 'about $1–$3 a transaction on Bitcoin rails';
+    case 'Binance': return 'about $0.10–$0.30 a transaction on BNB Chain';
+    case 'Base':
+    case 'Arbitrum':
+    case 'Optimism':
+    case 'Polygon':
+    case 'Blast':
+    case 'Mode':
+    case 'Ink':
+    case 'Unichain':
+    case 'Berachain':
+    case 'Monad':
+      return 'about $0.05–$0.30 a transaction on ' + chain;
+    default: return 'a few cents a transaction on ' + chain;
+  }
+}
+
+function sizeFor(tvl: number): string {
+  if (tvl >= 1_000_000_000) return '$5,000–$20,000';
+  if (tvl >= 250_000_000) return '$2,000–$10,000';
+  if (tvl >= 50_000_000) return '$500–$5,000';
+  return '$100–$1,000';
+}
+
+function parseArgs(argv: string[]): { input: string; output: string } {
+  let input = process.env.MAKEFUN_INPUT_DIR
+    ? join(process.env.MAKEFUN_INPUT_DIR, 'snapshot.json')
+    : '/input/snapshot.json';
   let output = process.env.MAKEFUN_OUTPUT_DIR || '/output';
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--input' && argv[i + 1]) input = argv[++i]!;
-    else if (argv[i] === '--output' && argv[i + 1]) output = argv[++i]!;
+    if (argv[i] === '--input' && argv[i + 1]) input = argv[++i];
+    else if (argv[i] === '--output' && argv[i + 1]) output = argv[++i];
   }
   return { input, output };
 }
 
-// ---------------------------------------------------------------- the filter
-
-const EXCLUDED_CATEGORIES = new Set([
-  'Bridge',
-  'Canonical Bridge',
-  'Liquid Staking',
-  'Liquid Restaking',
-  'Restaked BTC',
-  'CEX',
-]);
-const EXCHANGE_NAMES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
-const VERSION_TAIL = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
-
-/** A launch candidate: no token recorded, and not a wrapped, staked or
- *  bridged product of a token that already trades. */
-function isCandidate(p: Protocol): boolean {
-  if (p.gecko_id || p.symbol) return false;
-  if (p.category && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (WRAPPED_WORD.test(p.name)) return false;
-  if (EXCHANGE_NAMES.some((e) => p.name.startsWith(e))) return false;
-  if (VERSION_TAIL.test(p.name)) return false;
-  return true;
-}
-
-// ---------------------------------------------------------------- the model
-
-interface Model {
-  globalMedian: number;
-  multiples: Record<string, number>;
-}
-
-function buildModel(protocols: Protocol[]): Model {
-  // Token-bearing protocols, each ratio winsorized at 3x.
-  const ratios = protocols
-    .filter((p) => p.mcap_usd && p.tvl_usd && p.mcap_usd > 0 && p.tvl_usd > 0)
-    .map((p) => Math.min(p.mcap_usd! / p.tvl_usd, 3));
-  const globalMedian = median(ratios);
-  const byCat = new Map<string, number[]>();
-  for (const p of protocols) {
-    if (!p.mcap_usd || !p.tvl_usd || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    if (!p.category) continue;
-    const list = byCat.get(p.category) || [];
-    list.push(Math.min(p.mcap_usd / p.tvl_usd, 3));
-    byCat.set(p.category, list);
-  }
-  const multiples: Record<string, number> = {};
-  for (const [cat, list] of byCat) {
-    const m = median(list);
-    multiples[cat] = clamp((list.length * m + 3 * globalMedian) / (list.length + 3), 0.05, 1.5);
-  }
-  return { globalMedian, multiples };
-}
-
-function ageDays(asOf: string, listedAt: string | null): number | null {
-  if (!listedAt) return null;
-  const a = Date.parse(asOf + 'T00:00:00Z');
-  const b = Date.parse(listedAt + 'T00:00:00Z');
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.max(0, Math.round((a - b) / 86400000));
-}
-
-// ---------------------------------------------------------------- farm steps
-
-const GAS: Record<string, string> = {
-  Ethereum: '~$5-20 gas',
-  Solana: '~$0.05-0.20 gas',
-  Base: '~$0.10-1 gas',
-  Arbitrum: '~$0.10-1 gas',
-  Optimism: '~$0.10-1 gas',
-  Unichain: '~$0.10-1 gas',
-  Binance: '~$0.10-0.50 gas',
-  Polygon: '~$0.05-0.30 gas',
-  Avalanche: '~$0.20-1 gas',
-};
-
-function gasFor(chain: string): string {
-  return GAS[chain] || '~$1-5 gas';
-}
-
-function amountFor(tvl: number): string {
-  if (tvl >= 1_000_000_000) return '$2,000-10,000';
-  if (tvl >= 100_000_000) return '$1,000-5,000';
-  return '$500-2,000';
-}
-
-function fill(t: string, v: Record<string, string>): string {
-  return t.replace(/\{(\w+)\}/g, (_m, k: string) => v[k] || '');
-}
-
-type StepFn = (v: Record<string, string>) => string[];
-const S = (arr: string[]): StepFn => (v) => arr.map((t) => fill(t, v));
-
-const STEPS: Record<string, StepFn> = {
-  'Risk Curators': S([
-    'Bridge {amount} in USDC to {chain} through the chain’s official bridge ({gas}, 10-20 min) and keep $20 aside for exit gas; a curator vault is not a wallet, so the funds must arrive on {chain} first.',
-    'Deposit the USDC into {name}’s highest-TVL curated vault on {chain}: the curator allocates it across lending markets for you, so you do not pick positions yourself; confirm the vault’s stated strategy and fee before you confirm.',
-    'Leave the deposit untouched for 6-8 weeks. Curators are usually scored on duration, not on one-off deposits, so a single week in and out earns little; check the vault’s yield once a week and do nothing unless the strategy changes.',
-    'Add a second deposit of the same size in week 4 if the first one is earning as stated; never put more than 20% of your farming capital in one curator, because a single curator’s mistake is your loss.',
-    'Exit in two moves: withdraw from the vault back to USDC on {chain} (one transaction, {gas}), then bridge out. If a withdrawal queue exists, start it 3-5 days before you need the money.',
-  ]),
-  Dexs: S([
-    'Bridge {amount} to {chain} ({gas}, 10-20 min), split half into USDC and half into the chain’s native gas token, and keep $20 aside so a withdrawal never strands.',
-    'Provide liquidity in {name}’s deepest pool on {chain} — usually the USDC / native-token pair — with the full {amount}; a $1,000+ position earns meaningful fees, while a $50 position earns dust.',
-    'Hold the position 6-8 weeks and collect fees weekly; do not chase the highest-APY pool each day, because every move in and out costs gas and resets your time in the pool.',
-    'If the pool is a concentrated-liquidity pool, set a wide range around the current price so the position stays in range for weeks; a narrow range earns more per day but goes out of range and stops earning.',
-    'Exit by removing liquidity back to USDC and the native token in one transaction ({gas}), then bridge out. If one side of the pair has moved far, expect impermanent loss: the exit value can be below the deposit even when fees were earned.',
-  ]),
-  'Onchain Capital Allocator': S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas.',
-    'Deposit into {name}’s allocation vault on {chain}: the allocator routes your capital across its strategies, so read the vault’s current allocation and fee once before you deposit, then let it work.',
-    'Hold 8-12 weeks. Allocators compound slowly and are usually scored on how long capital stays, not on how often it moves; check the allocation monthly and move only if the strategy itself changes.',
-    'Do not split a small deposit across five allocators: one {amount} position in one vault beats five $100 positions that each pay their own gas to enter and exit.',
-    'Exit by withdrawing to USDC on {chain} ({gas}) and bridging out. If the vault has a lock or a queue, start the exit 5-7 days early.',
-  ]),
-  RWA: S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; most tokenised-asset vaults settle in USDC, so arrive in USDC, not in a volatile token.',
-    'Deposit into {name}’s tokenised-asset vault on {chain} and read the asset’s term first: a T-bill vault pays a stated yield to a stated maturity, a credit vault pays more for a longer lock. Pick the term you can actually hold.',
-    'Hold to the vault’s term — 4-12 weeks for short paper, longer for credit — and do not trade in and out: RWA yield is the point, and every exit and re-entry pays gas and loses days of yield.',
-    'Check once a month that the underlying asset is still the one stated (T-bills, invoices, credit) and that the vault’s reported value matches your deposit; if the asset changes, exit at the next window.',
-    'Exit at maturity or at the vault’s stated redemption window, back to USDC on {chain} ({gas}), then bridge out. Early exits on RWA vaults can carry a fee or a delay, so plan the exit date when you enter.',
-  ]),
-  Lending: S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas.',
-    'Supply the USDC on {name}’s {chain} lending market; a {amount} supply earns the base borrow yield plus whatever the protocol tracks for suppliers, and it is the safest first move on a lending protocol.',
-    'If you borrow, borrow no more than 30-40% of the supplied value and only in a stablecoin: a $1,000 supply supports at most a $300-400 borrow, and the health factor must stay above 1.5 at all times.',
-    'Hold the supply 6-8 weeks and check the health factor every 2-3 days if you borrowed; repay the borrow first if the collateral’s price falls 15% or more, before any liquidation can trigger.',
-    'Exit in two moves: repay any borrow in full, then withdraw the supply to USDC on {chain} ({gas}) and bridge out. Never withdraw the collateral while a borrow is still open.',
-  ]),
-  Yield: S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas.',
-    'Deposit into {name}’s highest-TVL yield vault on {chain}; a single {amount} deposit in the top vault beats the same money split across three small vaults, because each vault charges its own entry gas.',
-    'Leave it compounding for 6-8 weeks. Yield vaults are scored on time in the vault, and hopping between vaults every few days pays gas each time and resets your clock.',
-    'Check the vault’s reported APY once a week: if it falls by half and stays there for two weeks, move to the vault’s next-best strategy in one transaction rather than withdrawing to cash.',
-    'Exit by withdrawing the vault position back to USDC on {chain} ({gas}) and bridging out. If the vault has a withdrawal delay, start it 3-5 days before you need the funds.',
-  ]),
-  Derivatives: S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; perps settle in USDC, so arrive in USDC.',
-    'Open a small position on {name}’s {chain} perps market — no more than $500-1,000 of the {amount} at 2-3x leverage at most — or provide liquidity to the perps pool if you prefer earning fees to taking direction.',
-    'Set a stop-loss before you open: close the position if it loses 10% of its margin, and never add margin to a losing position. A farming position that liquidates earns nothing.',
-    'Trade or hold the pool position 4-6 weeks, in small size, once or twice a week at most; volume and time matter more than one big trade, and every trade pays a funding fee while it is open.',
-    'Close the position back to USDC on {chain} in one transaction ({gas}), then bridge out. If you provided pool liquidity instead, withdraw it the same way and check the pool’s PnL before you leave.',
-  ]),
-  CDP: S([
-    'Bridge {amount} in ETH or a liquid staking token to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; a CDP needs collateral you are willing to lock, not the stablecoin it mints.',
-    'Lock the collateral in {name}’s vault on {chain} and mint its stablecoin at no more than 40% of the collateral’s value: $1,000 of collateral supports at most $400 minted, and the liquidation ratio must stay well above the protocol’s minimum.',
-    'Hold the minted stablecoin or deploy it in a low-risk pool for 6-8 weeks, and check the collateral ratio every 2-3 days; if the collateral falls 20%, repay part of the minted amount the same day.',
-    'Do not mint to the maximum: a CDP at 70% of its limit liquidates on a normal market dip, while one at 40% survives it and keeps earning.',
-    'Exit in two moves: repay the minted stablecoin in full first, then unlock and withdraw the collateral ({gas}) and bridge out. Repaying late can cost a liquidation penalty, so start the exit before the collateral ratio gets tight.',
-  ]),
-  'Yield Aggregator': S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas.',
-    'Deposit into {name}’s top auto-compounding vault on {chain}; the aggregator moves the capital between strategies for you, so pick the vault with the highest TVL and let it compound.',
-    'Leave it for 6-8 weeks without touching it: auto-compounding only beats manual harvesting when the position stays put, and each harvest or move pays gas.',
-    'Compare the vault’s net APY once a week against the aggregator’s other vaults; move only if another vault beats it by more than 2% for two weeks running.',
-    'Exit by withdrawing to USDC on {chain} ({gas}) and bridging out. If the vault routes through several strategies, the withdrawal can take 1-3 days to unwind — start it early.',
-  ]),
-  'Basis Trading': S([
-    'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; basis vaults settle in USDC.',
-    'Deposit into {name}’s basis vault on {chain}: the vault earns the funding rate by holding spot and shorting perps, so read the current funding rate once before you deposit — a negative rate means the vault pays instead of earning.',
-    'Hold through at least one full funding cycle, 2-4 weeks, and then 4-8 weeks total; basis yield is lumpy by the day and only smooths out over weeks.',
-    'Check the funding rate weekly: if it stays negative for two weeks, pause new deposits and let the existing one run; do not add money to a vault that is paying to hold its hedge.',
-    'Exit by withdrawing to USDC on {chain} ({gas}) and bridging out. Basis vaults can take 1-3 days to unwind the hedge, so start the exit before you need the money.',
-  ]),
-  Chain: S([
-    'Bridge {amount} to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; a chain’s own asset is the gas token, so arrive holding some of it, not only USDC.',
-    'Use the chain weekly through its largest native app: transact, provide liquidity or lend on {chain} with the {amount} position rather than holding a single token — chain activity is what a future distribution usually measures.',
-    'If {chain} supports staking or delegation, stake or delegate half the position with a validator that charges under 10% commission and has no slashing history; unstaking can take days to weeks, so only stake what you can lock.',
-    'Keep the activity steady for 8-12 weeks: one real transaction a week beats twenty transactions in a day, and a single-day burst looks like a bot.',
-    'Exit by unstaking first if you staked (wait out the unbonding period), then bridge the native asset out ({gas}). Never bridge the full balance — leave a little gas on the chain.',
-  ]),
-};
-
-const GENERIC: StepFn = S([
-  'Bridge {amount} in USDC to {chain} ({gas}, 10-20 min) and keep $20 aside for exit gas; arrive in USDC, the settlement token most protocols on {chain} use.',
-  'Use {name}’s main product on {chain} with the full {amount}: deposit, supply or provide liquidity in its highest-TVL pool or vault, and read its fee and lock terms once before you confirm.',
-  'Hold the position 6-8 weeks and use it once a week: steady, repeated use over weeks is what farming programs usually reward, while a single deposit and immediate exit earns little.',
-  'Check the position weekly — yield, health factor or pool value — and move only if the product itself changes; hopping between protocols every few days pays gas each time and resets your clock.',
-  'Exit in two moves: unwind the position back to USDC on {chain} ({gas}), then bridge out. If the product has a lock or queue, start the exit 3-5 days before you need the money.',
-]);
-
-function farmSteps(p: Protocol, primaryChain: string): string[] {
-  const v: Record<string, string> = {
-    name: p.name,
-    chain: primaryChain,
-    amount: amountFor(p.tvl_usd),
-    gas: gasFor(primaryChain),
-    stable: 'USDC',
-  };
-  const fn = (p.category && STEPS[p.category]) || GENERIC;
-  return fn(v).map((s) => s.trim()).filter((s) => s.length >= 20 && s.length <= 600);
-}
-
-// ---------------------------------------------------------------- main
-
 function main(): void {
-  const { input, output } = parseArgs();
-  const snap = JSON.parse(readFileSync(input, 'utf8')) as Snapshot;
-  const watchlist = new Set(snap.watchlist);
-  const model = buildModel(snap.protocols);
+  const { input, output } = parseArgs(process.argv.slice(2));
+  const snap: Snapshot = JSON.parse(readFileSync(input, 'utf8'));
+  const asOf = new Date(snap.as_of + 'T00:00:00Z');
+  const watch = new Set(snap.watchlist);
 
-  const candidates = snap.protocols.filter(isCandidate);
+  // --- robust category multiples -------------------------------------------
+  const ratiosByCat = new Map<string, number[]>();
+  const allRatios: number[] = [];
+  for (const p of snap.protocols) {
+    // A zero market cap is a missing observation, not a 0x multiple:
+    // DefiLlama records the token but no market for it. Skip it.
+    if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
+      const r = Math.min(p.mcap_usd / p.tvl_usd, WINSOR);
+      allRatios.push(r);
+      const c = p.category ?? 'Uncategorized';
+      if (!ratiosByCat.has(c)) ratiosByCat.set(c, []);
+      ratiosByCat.get(c)!.push(r);
+    }
+  }
+  const globalMedian = median(allRatios);
+  const catStats = new Map<string, { n: number; med: number | null; mult: number; conf: FactorSet['confidenceLabel'] }>();
+  const cats = new Set(snap.protocols.map((p) => p.category ?? 'Uncategorized'));
+  for (const c of cats) {
+    const obs = ratiosByCat.get(c) ?? [];
+    const n = obs.length;
+    const med = n > 0 ? median(obs) : null;
+    const mult = n > 0
+      ? clamp((n * med! + PRIOR_WEIGHT * globalMedian) / (n + PRIOR_WEIGHT), MULT_MIN, MULT_MAX)
+      : clamp(globalMedian, MULT_MIN, MULT_MAX);
+    const conf: FactorSet['confidenceLabel'] = n >= 5 ? 'high' : n >= 2 ? 'medium' : n === 1 ? 'low' : 'none';
+    catStats.set(c, { n, med, mult, conf });
+  }
+  const confDiscount: Record<FactorSet['confidenceLabel'], number> = {
+    high: 1.0, medium: 0.97, low: 0.92, none: 0.88,
+  };
+
+  // --- board: every genuine launch candidate -------------------------------
+  const candidates = snap.protocols.filter(
+    (p) => p.gecko_id === null && p.symbol === null && excludedByHouseRule(p) === null,
+  );
+
   const rows: Row[] = candidates.map((p) => {
-    const catMult = p.category && model.multiples[p.category] !== undefined
-      ? model.multiples[p.category]!
-      : model.globalMedian;
-    const g = p.change_7d === null || p.change_7d === undefined ? 0 : p.change_7d;
-    const growthF = clamp(1 + g / 200, 0.7, 1.3);
-    const age = ageDays(snap.as_of, p.listed_at);
-    const maturityF = age === null ? 1 : 1 + 0.4 * Math.min(age, 730) / 730;
-    const breadthF = 1 + 0.02 * Math.min(Math.max(p.chains.length - 1, 0), 15);
-    const implied = Math.max(1, Math.round(p.tvl_usd * catMult * growthF * maturityF * breadthF));
-    const primaryChain = p.chains[0] || 'Ethereum';
+    const st = catStats.get(p.category ?? 'Uncategorized')!;
+    const growth = p.change_7d === null ? 1.0 : 1 + clamp(p.change_7d / 100, -0.3, 0.3);
+    let maturity = 0.925;
+    if (p.listed_at) {
+      const listed = new Date(p.listed_at + 'T00:00:00Z');
+      const ageYears = Math.max(0, (asOf.getTime() - listed.getTime()) / (365.25 * 86400 * 1000));
+      maturity = 0.85 + 0.15 * Math.min(ageYears / 3, 1);
+    }
+    const breadth = 1 + 0.05 * Math.min(Math.max(p.chains.length - 1, 0), 4);
+    const confidence = confDiscount[st.conf];
+    const implied = Math.max(
+      1,
+      Math.round(p.tvl_usd * st.mult * growth * maturity * breadth * confidence),
+    );
     return {
       slug: p.slug,
       name: p.name,
       rank: 0,
       implied_value_usd: implied,
-      farm_steps: farmSteps(p, primaryChain),
-      category: p.category || 'Uncategorised',
+      farm_steps: farmSteps(p),
+      category: p.category,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
       change_7d: p.change_7d,
-      age_days: age,
-      category_multiple: Math.round(catMult * 1000) / 1000,
-      growth_factor: Math.round(growthF * 1000) / 1000,
-      maturity_factor: Math.round(maturityF * 1000) / 1000,
-      breadth_factor: Math.round(breadthF * 1000) / 1000,
-      watchlist: watchlist.has(p.slug),
+      listed_at: p.listed_at,
+      watchlist: watch.has(p.slug),
+      factors: {
+        multiple: st.mult,
+        growth,
+        maturity,
+        breadth,
+        confidence,
+        confidenceLabel: st.conf,
+        catObs: st.n,
+        catMedian: st.med,
+      },
     };
   });
-  rows.sort((a, b) => b.implied_value_usd - a.implied_value_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+
+  rows.sort((a, b) =>
+    b.implied_value_usd - a.implied_value_usd ||
+    b.tvl_usd - a.tvl_usd ||
+    (a.slug < b.slug ? -1 : 1),
+  );
   rows.forEach((r, i) => { r.rank = i + 1; });
 
-  const totalImplied = rows.reduce((n, r) => n + r.implied_value_usd, 0);
-  const tokenCount = snap.protocols.filter((p) => p.gecko_id || p.symbol).length;
-  const excludedCount = snap.protocols.length - candidates.length - tokenCount;
-
+  // --- outputs --------------------------------------------------------------
   mkdirSync(output, { recursive: true });
-  const board = { as_of: snap.as_of, rows };
-  writeFileSync(join(output, 'board.json'), JSON.stringify(board, null, 2) + '\n', 'utf8');
-
-  const data = {
-    asOf: snap.as_of,
-    totalImplied,
-    rowCount: rows.length,
-    watchlistCount: rows.filter((r) => r.watchlist).length,
-    tokenCount,
-    excludedCount,
-    globalMedian: Math.round(model.globalMedian * 1000) / 1000,
-    multiples: Object.fromEntries(
-      Object.entries(model.multiples).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, Math.round(v * 1000) / 1000]),
-    ),
+  const totalImplied = rows.reduce((s, r) => s + r.implied_value_usd, 0);
+  const multiplesTable = [...catStats.entries()]
+    .map(([cat, st]) => ({
+      category: cat,
+      observations: st.n,
+      median: st.med === null ? null : +st.med.toFixed(3),
+      multiple: +st.mult.toFixed(3),
+      confidence: st.conf,
+    }))
+    .sort((a, b) => b.observations - a.observations || (a.category < b.category ? -1 : 1));
+  const board = {
+    meta: {
+      as_of: snap.as_of,
+      floor_usd: snap.floor_usd,
+      rows: rows.length,
+      watchlist_covered: rows.filter((r) => r.watchlist).length,
+      watchlist_total: snap.watchlist.length,
+      total_implied_usd: totalImplied,
+      global_median_mcap_tvl: +globalMedian.toFixed(4),
+      prior_weight: PRIOR_WEIGHT,
+      winsor_cap: WINSOR,
+      model: 'implied = TVL x category multiple x growth x maturity x breadth x confidence',
+    },
+    multiples: multiplesTable,
     rows,
   };
-  writeFileSync(join(output, 'data.js'), 'window.RADAR = ' + JSON.stringify(data) + ';\n', 'utf8');
+  writeFileSync(join(output, 'board.json'), JSON.stringify(board, null, 2) + '\n', 'utf8');
+  const dataJs = 'window.RADAR = ' + JSON.stringify(board) + ';\n';
+  writeFileSync(join(output, 'data.js'), dataJs, 'utf8');
 
-  const root = dirname(fileURLToPath(import.meta.url));
+  const root = resolve(import.meta.dirname ?? '.');
   cpSync(join(root, 'dashboard'), join(output, 'dashboard'), { recursive: true });
   cpSync(join(root, 'screenshots'), join(output, 'screenshots'), { recursive: true });
-
   const dossier = buildDossier(output, { text_max_bytes: 65536 });
   writeFileSync(join(output, 'dossier.json'), dossier);
 
-  console.log(`token-radar: ${rows.length} rows, ${rows.filter((r) => r.watchlist).length}/${snap.watchlist.length} watchlist, total implied $${(totalImplied / 1e9).toFixed(2)}B`);
-  console.log(`top 5: ${rows.slice(0, 5).map((r) => r.slug + ' $' + (r.implied_value_usd / 1e9).toFixed(2) + 'B').join(', ')}`);
-  console.log(`dossier: ${dossier.length} bytes`);
+  // --- self-check + report ---------------------------------------------------
+  const watchCovered = rows.filter((r) => r.watchlist).length;
+  const badSteps = rows.filter((r) =>
+    r.farm_steps.length < 3 || r.farm_steps.length > 12 ||
+    r.farm_steps.some((s) => s.trim().length < 20 || s.trim().length > 600),
+  );
+  const sorted = rows.every((r, i) => i === 0 || rows[i - 1].implied_value_usd >= r.implied_value_usd);
+  const ranksOk = rows.every((r, i) => r.rank === i + 1);
+  console.log(`token-radar r4: ${rows.length} rows, ${watchCovered}/${snap.watchlist.length} watchlist, total implied $${totalImplied.toLocaleString('en-US')}`);
+  console.log(`gate self-check: sorted=${sorted} ranks=${ranksOk} bad_step_rows=${badSteps.length} dossier=${dossier.length} bytes`);
+  console.log('top 5:');
+  for (const r of rows.slice(0, 5)) {
+    console.log(`  #${r.rank} ${r.slug} $${r.implied_value_usd.toLocaleString('en-US')} (TVL $${(r.tvl_usd / 1e6).toFixed(1)}M, ${r.category}, mult ${r.factors.multiple.toFixed(3)} ${r.factors.confidenceLabel} n=${r.factors.catObs})`);
+  }
+  const risk = catStats.get('Risk Curators')!;
+  console.log(`Risk Curators multiple: ${risk.mult.toFixed(3)} (median ${risk.med}, n=${risk.n}, ${risk.conf}) — single-observation weakness fixed by shrinkage`);
+  if (!sorted || !ranksOk || badSteps.length > 0 || watchCovered !== snap.watchlist.length) {
+    throw new Error('self-check failed');
+  }
+}
+
+// --- farm plans ---------------------------------------------------------------
+// Five steps per row, tailored to the protocol's category. Tokens:
+//   {N} name, {C} top chain, {S} position size by TVL tier, {G} gas note,
+//   {H} holding period. Every step is written to land in 88-252 chars.
+
+type Ctx = { name: string; chain: string; size: string; gas: string; hold: string };
+
+const HOLD_LONG = '6–12 months';
+const HOLD_MID = '3–6 months';
+
+const TEMPLATES: Record<string, string[]> = {
+  'Risk Curators': [
+    'Open {N} on {C} and connect a wallet you control; read the vault strategy, fees and withdrawal terms before depositing anything.',
+    'Deposit {S} into the highest-TVL {N} vault on {C} ({G}); one deposit opens the position and starts your exposure clock.',
+    'Leave the deposit working and add a second tranche of {S} after 2–4 weeks if the vault 7-day TVL trend stays positive.',
+    'Check the vault weekly for points, gauges or curator incentives; claim or compound any rewards issued to depositors.',
+    'Hold the position {H}; withdraw only after a token announcement or if TVL falls 30% in a week, and keep the farming wallet.',
+  ],
+  RWA: [
+    'Open {N} on {C} and connect a wallet you control; confirm which real-world asset backs the vault and who audits it.',
+    'Deposit {S} into the {N} vault on {C} ({G}); the yield comes from the underlying asset, not from emissions, so size for income.',
+    'Keep the position through at least one full yield cycle and record the payout dates; RWA points accrue to steady holders.',
+    'Reinvest payouts back into the same {N} vault while the asset backing is unchanged and the audit stays current.',
+    'Hold the position {H}; exit early only if the backing asset changes or the auditor flags the vault, and keep the farming wallet.',
+  ],
+  'Onchain Capital Allocator': [
+    'Open {N} on {C} and connect a wallet you control; read which strategies the allocator runs and what it charges.',
+    'Allocate {S} to the {N} strategy on {C} ({G}) with the longest live track record; one allocation is one position.',
+    'Let the allocator rotate the capital and check monthly that its reported allocation still matches the stated strategy.',
+    'Top up with {S} only after a full month of steady returns; never chase a single week of outperformance.',
+    'Hold the allocation {H}; redeem only after a token announcement or if the allocator changes strategy without notice.',
+  ],
+  'Basis Trading': [
+    'Open {N} on {C} and connect a wallet you control; understand the basis trade — long spot, short perps — before depositing.',
+    'Deposit {S} into the {N} basis vault on {C} ({G}); funding-rate income is the yield, so size for a steady carry, not a spike.',
+    'Watch the funding rate weekly; a persistently negative rate for two weeks is the signal to pause new deposits.',
+    'Compound funding payouts back into the {N} vault while the basis stays positive and the vault TVL keeps growing.',
+    'Hold the position {H}; exit if the basis inverts for a month or the vault pauses withdrawals, and keep the farming wallet.',
+  ],
+  Lending: [
+    'Open {N} on {C} and connect a wallet you control; check which assets you can supply and what the borrow rates are.',
+    'Supply {S} of a major asset to {N} on {C} ({G}); supplying is the farm — borrow only if you can repay it in full at any time.',
+    'Keep the supplied position open and borrow a small amount against it only to loop once, never to the liquidation edge.',
+    'Repay any looped borrow in full each month and re-supply the freed collateral so the position stays simple and safe.',
+    'Hold the supply position {H}; withdraw only after a token announcement or if utilization spikes above 90% for a week.',
+  ],
+  Dexs: [
+    'Open {N} on {C} and connect a wallet you control; find the deepest pool for a pair you already hold.',
+    'Add {S} of liquidity to the top {N} pool on {C} ({G}); concentrated ranges earn more but need weekly rebalancing.',
+    'Trade a small amount through {N} each week so the wallet shows real usage, not only a passive liquidity position.',
+    'Collect trading fees weekly and re-add them to the same pool while volume on {N} stays in its recent range.',
+    'Hold the liquidity {H}; remove it only after a token announcement or if pool volume halves for two straight weeks.',
+  ],
+  Yield: [
+    'Open {N} on {C} and connect a wallet you control; read what the yield strategy holds and where the yield comes from.',
+    'Deposit {S} into the {N} yield vault on {C} ({G}); the vault compounds for you, so the job is to stay in, not to trade.',
+    'Check the vault monthly for strategy changes; a vault that changes strategy without notice is a vault to leave.',
+    'Add {S} in a second tranche after one full month of steady yield, never on the back of a single good week.',
+    'Hold the deposit {H}; withdraw only after a token announcement or if the yield turns negative for a full month.',
+  ],
+  'Yield Aggregator': [
+    'Open {N} on {C} and connect a wallet you control; see which underlying vaults the aggregator routes your deposit to.',
+    'Deposit {S} into the top {N} vault on {C} ({G}); the aggregator auto-compounds, so deposit once and let it work.',
+    'Review the routing monthly to confirm your funds still sit in the vaults the aggregator advertised at deposit time.',
+    'Harvest and re-deposit any aggregator rewards the same week they arrive; unclaimed rewards are yield left behind.',
+    'Hold the deposit {H}; exit only after a token announcement or if the aggregator routes funds to an unaudited vault.',
+  ],
+  CDP: [
+    'Open {N} on {C} and connect a wallet you control; read the collateral ratio rules and the liquidation penalty first.',
+    'Lock {S} of collateral in {N} on {C} ({G}) and mint well under the limit — keep the ratio at least double the minimum.',
+    'Use the minted stablecoin in a low-risk venue and keep enough collateral headroom to survive a 40% price drop.',
+    'Top up collateral whenever the ratio drifts toward the minimum; never let a position sit near liquidation overnight.',
+    'Hold the CDP {H}; close it only after a token announcement or if the peg breaks by more than 2% for a week.',
+  ],
+  Restaking: [
+    'Open {N} on {C} and connect a wallet you control; confirm which operators and AVSs your restake secures.',
+    'Restake {S} through {N} on {C} ({G}); pick an operator with a long uptime record, not the one offering the highest points.',
+    'Keep the restake active and check monthly that your operator still runs the AVSs it promised to secure.',
+    'Claim restaking points or rewards weekly and restake them where the protocol allows compounding.',
+    'Hold the restake {H}; unstake only after a token announcement or if your operator goes offline for more than a week.',
+  ],
+  Chain: [
+    'Open {N} on {C} and connect a wallet you control; bridge {S} onto the chain and keep a little native gas aside.',
+    'Use the chain daily for a week — swap, provide liquidity or mint — so the wallet builds a real on-chain history; each action costs {G}.',
+    'Keep {S} of value active on {N} across at least two native apps; single-app users rarely top airdrop lists.',
+    'Repeat the activity weekly and try each new native app as it launches; early users of new apps are usually rewarded.',
+    'Stay active {H}; wind down only after a token announcement, and keep the same wallet that built the history.',
+  ],
+  CeDeFi: [
+    'Open {N} on {C} and connect a wallet you control; verify the custodian and the proof-of-reserves before depositing.',
+    'Deposit {S} into the {N} vault on {C} ({G}); CeDeFi yield comes from off-chain desks, so custody terms matter most.',
+    'Read the monthly proof-of-reserves and confirm the custodian still holds the assets the vault claims to hold.',
+    'Reinvest payouts into the same {N} vault while reserves stay fully backed and the custodian is unchanged.',
+    'Hold the deposit {H}; withdraw at once if reserves fall short or the custodian changes, and keep the farming wallet.',
+  ],
+};
+
+const GENERIC_STEPS: string[] = [
+  'Open {N} on {C} and connect a wallet you control; read the protocol docs and fee schedule before depositing anything.',
+  'Deposit {S} into the main {N} pool or vault on {C} ({G}); one deposit opens the position and starts your exposure clock.',
+  'Use the protocol weekly — deposit, swap or vote — so the wallet shows real activity, not a single idle deposit.',
+  'Claim any points or rewards {N} issues each week and re-deposit them while the protocol TVL trend stays positive.',
+  'Hold the position {H}; exit only after a token announcement or if TVL falls 30% in a week, and keep the farming wallet.',
+];
+
+function farmSteps(p: Protocol): string[] {
+  const chain = p.chains.length > 0 ? p.chains[0] : 'Ethereum';
+  const ctx: Ctx = {
+    name: p.name,
+    chain,
+    size: sizeFor(p.tvl_usd),
+    gas: gasNote(chain),
+    hold: p.tvl_usd >= 250_000_000 ? HOLD_LONG : HOLD_MID,
+  };
+  const tpl = (p.category !== null && TEMPLATES[p.category]) || GENERIC_STEPS;
+  return tpl.map((s) =>
+    s
+      .replaceAll('{N}', ctx.name)
+      .replaceAll('{C}', ctx.chain)
+      .replaceAll('{S}', ctx.size)
+      .replaceAll('{G}', ctx.gas)
+      .replaceAll('{H}', ctx.hold),
+  );
 }
 
 main();
