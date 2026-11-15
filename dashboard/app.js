@@ -1,163 +1,189 @@
-// Token Launch Radar — dashboard app. Renders window.TOKEN_RADAR (data.js).
-// No network: every byte the page needs is in the board it ships with.
+// Token Launch Radar — dashboard logic.
+//
+// The value model, in code, so the page and the board agree:
+//   implied = TVL x categoryMultiple x growth x maturity x breadth
+//   categoryMultiple: median market-cap / TVL of the token-bearing
+//     protocols in the same category (ratios winsorized at 3x), shrunk
+//     toward the global median with prior weight 3, clamped [0.05, 1.50].
+//   growth   = clamp(1 + change_7d / 200, 0.70, 1.30)
+//   maturity = 1 + 0.4 x min(ageDays, 730) / 730
+//   breadth  = 1 + 0.02 x min(chains - 1, 15)
+// main.ts computes every row this way from the snapshot; this file only
+// renders the rows, so a screenshot and the code behind it can never disagree.
 
-(function () {
-  'use strict';
-  var DATA = window.TOKEN_RADAR;
-  if (!DATA) return;
-  var rows = DATA.rows;
-  var stats = DATA.stats;
+const MODEL = {
+  formula: 'implied = tvl * categoryMultiple * growth * maturity * breadth',
+  globalMedian: null, // filled from the snapshot at render time (see below)
+  priorWeight: 3,
+  ratioCap: 3,
+  multipleClamp: [0.05, 1.5],
+  growth: 'clamp(1 + change_7d / 200, 0.70, 1.30)',
+  maturity: '1 + 0.4 * min(ageDays, 730) / 730',
+  breadth: '1 + 0.02 * min(chains - 1, 15)',
+};
 
-  function fmtUsd(n) {
-    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
-    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return '$' + (n / 1e3).toFixed(0) + 'K';
-    return '$' + n;
-  }
-  function fmtPct(x) {
-    if (x === null || x === undefined) return '—';
-    var s = (x > 0 ? '+' : '') + x.toFixed(1) + '%';
-    return s;
-  }
-  function esc(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
+const D = window.RADAR;
+MODEL.globalMedian = D.globalMedian;
+document.getElementById('global-median').textContent = D.globalMedian.toFixed(3);
+const $ = (id) => document.getElementById(id);
+const fmtUsd = (n) => n >= 1e9 ? '$' + (n / 1e9).toFixed(2) + 'B'
+  : n >= 1e6 ? '$' + (n / 1e6).toFixed(1) + 'M'
+  : '$' + Math.round(n).toLocaleString('en-US');
+const fmtPct = (g) => g === null || g === undefined ? '—'
+  : (g > 0 ? '+' : '') + g.toFixed(1) + '%';
+const fmtAge = (a) => a === null || a === undefined ? '—'
+  : a >= 365 ? (a / 365).toFixed(1) + 'y' : a + 'd';
 
-  // ---- stats bar
-  var statsEl = document.getElementById('stats');
-  var statItems = [
-    ['Protocols', String(rows.length)],
-    ['Watchlist', stats.watchlist_covered + ' / ' + stats.watchlist],
-    ['Total implied', fmtUsd(stats.total_implied_usd)],
-    ['Snapshot', stats.as_of],
-  ];
-  statsEl.innerHTML = statItems.map(function (kv) {
-    return '<div><dt>' + esc(kv[0]) + '</dt><dd>' + esc(kv[1]) + '</dd></div>';
+// ---- header stats -------------------------------------------------------
+$('stats').innerHTML =
+  stat(fmtUsd(D.totalImplied), 'total implied value') +
+  stat(String(D.rowCount), 'protocols ranked') +
+  stat(String(D.watchlistCount), 'on the watchlist') +
+  stat(D.asOf, 'snapshot date');
+function stat(b, s) {
+  return '<div class="stat"><b>' + b + '</b><span>' + s + '</span></div>';
+}
+
+$('excluded-note').textContent =
+  D.tokenCount + ' protocols in the snapshot already have a token that trades, and ' +
+  D.excludedCount + ' more record no token but are a wrapped, staked or bridged product, ' +
+  'an exchange, or a versioned copy.';
+
+// ---- multiples table ----------------------------------------------------
+const mt = document.querySelector('#mult-table tbody');
+mt.innerHTML = Object.entries(D.multiples)
+  .map(([c, m]) => '<tr><td>' + esc(c) + '</td><td>' + m.toFixed(3) + '&times;</td></tr>')
+  .join('');
+
+// ---- category filter ----------------------------------------------------
+const cats = [...new Set(D.rows.map((r) => r.category))].sort();
+$('cat-filter').innerHTML = '<option value="">All categories</option>' +
+  cats.map((c) => '<option>' + esc(c) + '</option>').join('');
+
+// ---- board ---------------------------------------------------------------
+let sortKey = 'rank';
+let sortDir = 1;
+let selected = null;
+
+function visibleRows() {
+  const q = $('search').value.trim().toLowerCase();
+  const cat = $('cat-filter').value;
+  const watchOnly = $('watch-only').checked;
+  const top100 = $('top100').checked;
+  let rows = D.rows.filter((r) => {
+    if (q && !(r.name.toLowerCase().includes(q) || r.slug.includes(q))) return false;
+    if (cat && r.category !== cat) return false;
+    if (watchOnly && !r.watchlist) return false;
+    if (top100 && r.rank > 100) return false;
+    return true;
+  });
+  rows = [...rows].sort((a, b) => {
+    const av = a[sortKey];
+    const bv = b[sortKey];
+    if (Array.isArray(av) && Array.isArray(bv)) return sortDir * (av.length - bv.length);
+    if (typeof av === 'string') return sortDir * av.localeCompare(bv);
+    return sortDir * ((av === null ? -Infinity : av) - (bv === null ? -Infinity : bv));
+  });
+  return rows;
+}
+
+function renderBoard() {
+  const rows = visibleRows();
+  $('count').textContent = rows.length + ' of ' + D.rows.length + ' shown';
+  const tb = document.querySelector('#board tbody');
+  tb.innerHTML = rows.map((r) => {
+    const g = r.change_7d;
+    const cls = g === null ? '' : g >= 0 ? 'pos' : 'neg';
+    return '<tr data-slug="' + r.slug + '"' + (selected === r.slug ? ' class="sel"' : '') + '>' +
+      '<td>' + r.rank + '</td>' +
+      '<td><span class="nm">' + esc(r.name) + '</span>' +
+      (r.watchlist ? '<span class="badge">WATCHLIST</span>' : '') +
+      '<span class="sl">' + r.slug + '</span></td>' +
+      '<td>' + esc(r.category) + '</td>' +
+      '<td>' + r.chains.slice(0, 3).map(esc).join(', ') + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</td>' +
+      '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
+      '<td class="num ' + cls + '">' + fmtPct(g) + '</td>' +
+      '<td class="num">' + fmtAge(r.age_days) + '</td>' +
+      '<td class="num implied">' + fmtUsd(r.implied_value_usd) + '</td></tr>';
   }).join('');
+}
 
-  // ---- category dropdown
-  var cats = [];
-  rows.forEach(function (r) { if (r.category && cats.indexOf(r.category) === -1) cats.push(r.category); });
-  cats.sort();
-  var catSel = document.getElementById('category');
-  cats.forEach(function (c) {
-    var o = document.createElement('option');
-    o.value = c; o.textContent = c;
-    catSel.appendChild(o);
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ---- detail ---------------------------------------------------------------
+function renderDetail(r) {
+  const calc = fmtUsd(r.tvl_usd) + ' &times; ' + r.category_multiple.toFixed(3) +
+    ' &times; ' + r.growth_factor.toFixed(3) + ' &times; ' + r.maturity_factor.toFixed(3) +
+    ' &times; ' + r.breadth_factor.toFixed(3) + ' = ' + fmtUsd(r.implied_value_usd) +
+    ' (factors shown rounded to 3 decimals; the board uses full precision)';
+  const why = r.watchlist
+    ? 'On the house watchlist: TVL at or above $50M, no token recorded, and not a wrapped, staked or bridged product.'
+    : 'Below the watchlist floor or outside its rule, but the same filter: no token recorded and not a wrapped, staked or bridged product — the early one this radar exists to find.';
+  $('detail').innerHTML =
+    '<h2>' + esc(r.name) + (r.watchlist ? '<span class="badge">WATCHLIST</span>' : '') + '</h2>' +
+    '<p class="meta">Rank #' + r.rank + ' &middot; ' + esc(r.category) + ' &middot; ' +
+    r.chains.map(esc).join(', ') + ' &middot; ' + esc(r.slug) + '</p>' +
+    '<div class="breakdown">' +
+    factor(fmtUsd(r.tvl_usd), 'TVL in the snapshot') +
+    factor(r.category_multiple.toFixed(3) + '&times;', 'category multiple (' + esc(r.category) + ')') +
+    factor(r.growth_factor.toFixed(3) + '&times;', 'growth (7d ' + fmtPct(r.change_7d) + ')') +
+    factor(r.maturity_factor.toFixed(3) + '&times;', 'maturity (' + fmtAge(r.age_days) + ' with no token)') +
+    factor(r.breadth_factor.toFixed(3) + '&times;', 'breadth (' + r.chains.length + ' chains)') +
+    factor(fmtUsd(r.implied_value_usd), 'implied value', true) +
+    '</div>' +
+    '<p class="calc"><code>' + calc + '</code></p>' +
+    '<h3>How to farm it</h3>' +
+    '<ol>' + r.farm_steps.map((s) => '<li>' + esc(s) + '</li>').join('') + '</ol>' +
+    '<p class="why">' + why + ' The implied value is the radar’s own claim from the snapshot’s figures — ' +
+    'not a price, and not a promise that a token launches.</p>';
+}
+function factor(b, s, total) {
+  return '<div class="factor' + (total ? ' total' : '') + '"><b>' + b + '</b><span>' + s + '</span></div>';
+}
+
+// ---- events ---------------------------------------------------------------
+document.querySelector('#board tbody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  selected = tr.dataset.slug;
+  const r = D.rows.find((x) => x.slug === selected);
+  if (r) { renderDetail(r); renderBoard(); }
+});
+document.querySelectorAll('#board th[data-sort]').forEach((th) => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    if (sortKey === k) sortDir = -sortDir;
+    else { sortKey = k; sortDir = k === 'name' || k === 'category' ? 1 : -1; }
+    renderBoard();
   });
+});
+['search', 'cat-filter', 'watch-only', 'top100'].forEach((id) => {
+  $(id).addEventListener('input', renderBoard);
+  $(id).addEventListener('change', renderBoard);
+});
 
-  // ---- filters (also readable from the URL: ?filter=watchlist, ?category=X, ?q=text, #slug=...)
-  var params = new URLSearchParams(window.location.search);
-  var state = {
-    filter: params.get('filter') || 'all',
-    category: params.get('category') || '',
-    q: params.get('q') || '',
-    slug: (window.location.hash.match(/slug=([^&]+)/) || [])[1] || null,
-  };
-  var filterBtns = document.querySelectorAll('.filter-btn');
-  function syncFilterButtons() {
-    filterBtns.forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-filter') === state.filter); });
+renderBoard();
+renderDetail(D.rows[0]);
+
+// ---- deep links (for the entry's own screenshots; also useful to a reader) ----
+// ?view=detail&slug=<slug> opens that protocol's detail and scrolls to it.
+// ?view=watchlist turns the watchlist filter on.
+(function deepLink() {
+  const q = new URLSearchParams(location.search);
+  const view = q.get('view');
+  if (view === 'watchlist') {
+    $('watch-only').checked = true;
+    renderBoard();
+    return;
   }
-  if (state.category) catSel.value = state.category;
-  var searchEl = document.getElementById('search');
-  if (state.q) searchEl.value = state.q;
-  syncFilterButtons();
-
-  document.getElementById('count-all').textContent = '(' + rows.length + ')';
-  document.getElementById('count-watchlist').textContent = '(' + stats.watchlist_covered + ')';
-
-  var tbody = document.getElementById('rows');
-  var shownEl = document.getElementById('shown');
-  var layout = document.querySelector('.layout');
-  var detail = document.getElementById('detail');
-  var detailBody = document.getElementById('detail-body');
-
-  function visibleRows() {
-    var q = state.q.trim().toLowerCase();
-    return rows.filter(function (r) {
-      if (state.filter === 'watchlist' && !r.watchlist) return false;
-      if (state.category && r.category !== state.category) return false;
-      if (q && r.name.toLowerCase().indexOf(q) === -1 && r.slug.toLowerCase().indexOf(q) === -1) return false;
-      return true;
-    });
+  if (view === 'detail') {
+    const slug = q.get('slug');
+    const r = D.rows.find((x) => x.slug === slug) || D.rows[0];
+    selected = r.slug;
+    document.body.classList.add('detail-only');
+    renderDetail(r);
+    renderBoard();
   }
-
-  function chainChips(r) {
-    var chips = r.chains.slice(0, 4).map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('');
-    if (r.chains.length > 4) chips += '<span class="chip more">+' + (r.chains.length - 4) + '</span>';
-    return '<span class="chips">' + chips + '</span>';
-  }
-
-  function render() {
-    var list = visibleRows();
-    var html = list.map(function (r) {
-      var chg = r.change_7d === null ? '<span>—</span>' : '<span class="' + (r.change_7d >= 0 ? 'up' : 'down') + '">' + fmtPct(r.change_7d) + '</span>';
-      return '<tr data-slug="' + esc(r.slug) + '">' +
-        '<td class="rank">' + r.rank + '</td>' +
-        '<td class="proto"><span class="name">' + esc(r.name) + '</span>' + (r.watchlist ? '<span class="badge">Watchlist</span>' : '') + '<br><span class="slug">' + esc(r.slug) + '</span></td>' +
-        '<td class="cat">' + esc(r.category || '—') + '</td>' +
-        '<td class="chains">' + chainChips(r) + '</td>' +
-        '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
-        '<td class="num">' + chg + '</td>' +
-        '<td class="num"><span class="val">' + fmtUsd(r.implied_value_usd) + '</span></td>' +
-        '</tr>';
-    }).join('');
-    tbody.innerHTML = html;
-    shownEl.textContent = 'Showing ' + list.length + ' of ' + rows.length + ' protocols' +
-      (state.filter === 'watchlist' ? ' — watchlist only' : '') +
-      (state.category ? ' — ' + state.category : '') + '.';
-  }
-
-  function openDetail(slug) {
-    var r = null;
-    rows.forEach(function (x) { if (x.slug === slug) r = x; });
-    if (!r) return;
-    var peers = (stats.category_peers && stats.category_peers[r.category] !== undefined) ? stats.category_peers[r.category] : null;
-    var multLabel = 'Category multiple (' + (r.category || '—') + (peers === null ? ', no tokenized peer' : ', ' + peers + ' peer' + (peers === 1 ? '' : 's')) + ')';
-    var breakdown = [
-      ['TVL', fmtUsd(r.tvl_usd)],
-      [multLabel, '×' + r.category_multiple.toFixed(2)],
-      ['Growth (7d ' + fmtPct(r.change_7d) + ')', '×' + r.growth_factor.toFixed(2)],
-      ['Maturity' + (r.listed_at ? ' (since ' + r.listed_at + ')' : ''), '×' + r.maturity_factor.toFixed(2)],
-      ['Breadth (' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + ')', '×' + r.breadth_factor.toFixed(2)],
-    ];
-    var steps = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
-    detailBody.innerHTML =
-      '<h2>' + esc(r.name) + '</h2>' +
-      '<p class="dslug">' + esc(r.slug) + ' · Rank #' + r.rank + (r.watchlist ? ' · <span class="badge">Watchlist</span>' : '') + '</p>' +
-      '<div class="dval-label">Implied value</div><div class="dval">' + fmtUsd(r.implied_value_usd) + '</div>' +
-      '<h3>How the value is built</h3>' +
-      '<table class="breakdown"><tbody>' +
-      breakdown.map(function (kv) { return '<tr><td>' + esc(kv[0]) + '</td><td>' + esc(kv[1]) + '</td></tr>'; }).join('') +
-      '<tr class="total"><td>Implied value</td><td>' + fmtUsd(r.implied_value_usd) + '</td></tr>' +
-      '</tbody></table>' +
-      '<p class="meta">Category: ' + esc(r.category || '—') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + (r.listed_at ? ' · tracked since ' + r.listed_at : '') + '</p>' +
-      '<h3>Farm plan — 6 steps</h3>' +
-      '<ol class="farm">' + steps + '</ol>';
-    detail.hidden = false;
-    layout.classList.add('detail-open');
-    var tr = tbody.querySelector('tr[data-slug="' + r.slug.replace(/"/g, '') + '"]');
-    tbody.querySelectorAll('tr.selected').forEach(function (t) { t.classList.remove('selected'); });
-    if (tr) tr.classList.add('selected');
-  }
-
-  function closeDetail() {
-    detail.hidden = true;
-    layout.classList.remove('detail-open');
-    tbody.querySelectorAll('tr.selected').forEach(function (t) { t.classList.remove('selected'); });
-  }
-
-  tbody.addEventListener('click', function (e) {
-    var tr = e.target.closest('tr[data-slug]');
-    if (tr) openDetail(tr.getAttribute('data-slug'));
-  });
-  document.getElementById('close-detail').addEventListener('click', closeDetail);
-  filterBtns.forEach(function (b) {
-    b.addEventListener('click', function () { state.filter = b.getAttribute('data-filter'); syncFilterButtons(); render(); });
-  });
-  catSel.addEventListener('change', function () { state.category = catSel.value; render(); });
-  searchEl.addEventListener('input', function () { state.q = searchEl.value; render(); });
-
-  render();
-  if (state.slug) openDetail(decodeURIComponent(state.slug));
 })();

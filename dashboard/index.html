@@ -3,72 +3,93 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Launch Radar — pre-token protocols, ranked by implied value</title>
+<title>Token Launch Radar — 198 protocols, no token yet, ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header class="top">
-  <div class="title-block">
-    <h1>Token Launch Radar</h1>
-    <p class="sub">Which pre-token protocol is worth farming next, and what to do about it. Ranked by an implied value the model states, not by TVL alone.</p>
+  <div class="top-inner">
+    <div>
+      <h1>Token Launch Radar</h1>
+      <p class="sub">Every protocol in the snapshot that records <strong>no token</strong> and is not a
+      wrapped, staked or bridged product of one that already trades — ranked by what its
+      token would be worth if it launched one day, on the snapshot’s own figures.</p>
+    </div>
+    <div class="stats" id="stats"></div>
   </div>
-  <dl class="stats" id="stats"></dl>
 </header>
 
-<section class="method">
-  <p class="method-line"><strong>Implied value = TVL &times; category multiple &times; growth &times; maturity &times; breadth</strong> — calibrated on the tokenized peers in each category. The global median is 0.17&times;, dragged down by many small tokenized protocols; each category multiple reflects that category&rsquo;s larger, more comparable peers.</p>
-  <details class="method-details">
-    <summary>How the ranking works</summary>
-    <div class="method-body">
-      <p><strong>Category multiple.</strong> For each category, the median market-cap-to-TVL ratio of its tokenized protocols (winsorized to 0.005&ndash;5), shrunk toward the global median of 0.17&times; with a prior weight of 3, clipped to 0.03&ndash;1.5. A category with no tokenized peer falls back to the global median. Risk Curators read 0.87&times; on a single peer; Lending reads 0.14&times; on fifteen.</p>
-      <p><strong>Growth.</strong> The 7-day TVL change at 60% weight, clamped to &minus;25%..+50%. A protocol growing fast earns more than a flat one at the same TVL.</p>
-      <p><strong>Maturity.</strong> 4% a year, capped at 3 years, from the day DefiLlama began tracking the protocol. Older protocols have had longer to earn trust.</p>
-      <p><strong>Breadth.</strong> The chain count, log-scaled, capped at &times;1.08. A protocol live on many chains is worth a little more than one on a single chain.</p>
-      <p><strong>The board.</strong> Every protocol DefiLlama records no token for (and that is not a wrapped, staked or bridged product of a token that already trades). The watchlist is the 40 of them at or above $50M TVL; the board adds every pre-token protocol below the floor, so it is the whole launch universe, not just the floor.</p>
-      <p><strong>The farm plan.</strong> Six steps per protocol, written for its category: how to enter, the core action, how to size it, what keeps it eligible, the weekly rhythm, and what to track. Steps bend with the protocol&rsquo;s own 7-day change and with watchlist status.</p>
+<main>
+  <section class="method" id="method">
+    <h2>How the value is computed</h2>
+    <p class="formula">implied value = TVL &times; category multiple &times; growth &times; maturity &times; breadth</p>
+    <div class="method-grid">
+      <div>
+        <h3>Category multiple</h3>
+        <p>For each category, the median market-cap / TVL of the token-bearing protocols in that
+        category — each protocol’s ratio winsorized at 3&times;, so one tiny-TVL token cannot set a
+        category — shrunk toward the global median (<span id="global-median"></span>) with a prior weight of 3, clamped to
+        0.05–1.50. A category with no token-bearing protocol uses the global median. The multiples
+        are computed from this snapshot, not written in by hand.</p>
+      </div>
+      <div>
+        <h3>Growth &middot; maturity &middot; breadth</h3>
+        <p><strong>Growth</strong> = 1 + 7-day TVL change / 200, clamped to 0.70–1.30.
+        <strong>Maturity</strong> = 1 + 0.4 &times; min(age in days, 730) / 730: a protocol that has
+        run two years with no token scores up to 1.40.
+        <strong>Breadth</strong> = 1 + 0.02 &times; min(chains &minus; 1, 15): more chains, wider reach.</p>
+      </div>
+      <div>
+        <h3>Who is not ranked, and why</h3>
+        <p><span id="excluded-note"></span> A protocol whose token already trades has no launch
+        left to value. A wrapped, staked or bridged product (WBTC is Bitcoin on Ethereum) is not a
+        protocol waiting on a launch of its own. Centralised exchanges and versioned copies are
+        out for the same reason. The board is the 198 protocols that pass that filter.</p>
+      </div>
     </div>
-  </details>
-</section>
+    <details class="multiples">
+      <summary>Category multiples used (computed from the snapshot)</summary>
+      <table id="mult-table"><thead><tr><th>Category</th><th>Multiple</th></tr></thead><tbody></tbody></table>
+    </details>
+  </section>
 
-<section class="controls">
-  <div class="filters" role="group" aria-label="Filter">
-    <button class="filter-btn active" data-filter="all">All <span class="count" id="count-all"></span></button>
-    <button class="filter-btn" data-filter="watchlist">Watchlist only <span class="count" id="count-watchlist"></span></button>
-  </div>
-  <select id="category" aria-label="Category">
-    <option value="">All categories</option>
-  </select>
-  <input id="search" type="search" placeholder="Search name or slug&hellip;" aria-label="Search">
-</section>
+  <section class="controls">
+    <input id="search" type="search" placeholder="Search name or slug…" aria-label="Search protocols">
+    <select id="cat-filter" aria-label="Filter by category"><option value="">All categories</option></select>
+    <label class="toggle"><input type="checkbox" id="watch-only"> Watchlist only (40)</label>
+    <label class="toggle"><input type="checkbox" id="top100"> Top 100</label>
+    <span class="count" id="count"></span>
+  </section>
 
-<main class="layout">
-  <div class="table-wrap">
-    <table id="board">
+  <section class="board-wrap">
+    <table class="board" id="board">
       <thead>
         <tr>
-          <th class="rank">#</th>
-          <th class="proto">Protocol</th>
-          <th class="cat">Category</th>
-          <th class="chains">Chains</th>
-          <th class="num">TVL</th>
-          <th class="num">7d</th>
-          <th class="num">Implied value</th>
+          <th data-sort="rank">#</th>
+          <th data-sort="name">Protocol</th>
+          <th data-sort="category">Category</th>
+          <th data-sort="chains">Chains</th>
+          <th data-sort="tvl_usd" class="num">TVL</th>
+          <th data-sort="change_7d" class="num">7d</th>
+          <th data-sort="age_days" class="num">Age</th>
+          <th data-sort="implied_value_usd" class="num">Implied value</th>
         </tr>
       </thead>
-      <tbody id="rows"></tbody>
+      <tbody></tbody>
     </table>
-    <p class="foot" id="shown"></p>
-  </div>
-  <aside class="detail" id="detail" hidden>
-    <button class="close" id="close-detail" aria-label="Close detail">&times;</button>
-    <div id="detail-body"></div>
-  </aside>
+  </section>
+
+  <section class="detail" id="detail" aria-live="polite">
+    <p class="detail-empty">Click a row to see the protocol’s full value breakdown and its farm plan.</p>
+  </section>
+
+  <footer>
+    <p>Data: DefiLlama protocol snapshot, fetched 2026-11-14 (as-of date in the board header).
+    Implied values are this radar’s own claim from the snapshot’s figures, never a price or a
+    prediction that a token will launch. Farm steps are a plan, not advice: check each protocol’s
+    own terms, fees and risks before you deposit anything.</p>
+  </footer>
 </main>
-
-<footer class="foot-note">
-  <p>Data: DefiLlama protocol snapshot, sealed 2026-11-14. A protocol is listed as pre-token when DefiLlama records no token for it; that is the record, not proof it has none. Implied value is this radar&rsquo;s own claim, never a promise of a launch or a price.</p>
-</footer>
-
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
