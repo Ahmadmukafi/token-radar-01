@@ -3,93 +3,97 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Launch Radar — 198 protocols, no token yet, ranked by implied value</title>
+<title>Token Launch Radar — every pre-token protocol, ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<header class="top">
-  <div class="top-inner">
-    <div>
-      <h1>Token Launch Radar</h1>
-      <p class="sub">Every protocol in the snapshot that records <strong>no token</strong> and is not a
-      wrapped, staked or bridged product of one that already trades — ranked by what its
-      token would be worth if it launched one day, on the snapshot’s own figures.</p>
-    </div>
-    <div class="stats" id="stats"></div>
+<header>
+  <div class="title-block">
+    <h1>TOKEN LAUNCH RADAR</h1>
+    <p class="sub">Every protocol that records no token, ranked by what its token would be worth if the record stayed as it is.</p>
+  </div>
+  <div class="head-stats">
+    <div class="stat"><span class="stat-v" id="stat-rows">—</span><span class="stat-l">candidates</span></div>
+    <div class="stat"><span class="stat-v" id="stat-watch">—</span><span class="stat-l">on the watchlist</span></div>
+    <div class="stat"><span class="stat-v" id="stat-total">—</span><span class="stat-l">total implied value</span></div>
+    <div class="stat"><span class="stat-v" id="stat-asof">—</span><span class="stat-l">snapshot date</span></div>
   </div>
 </header>
 
-<main>
-  <section class="method" id="method">
-    <h2>How the value is computed</h2>
-    <p class="formula">implied value = TVL &times; category multiple &times; growth &times; maturity &times; breadth</p>
-    <div class="method-grid">
-      <div>
-        <h3>Category multiple</h3>
-        <p>For each category, the median market-cap / TVL of the token-bearing protocols in that
-        category — each protocol’s ratio winsorized at 3&times;, so one tiny-TVL token cannot set a
-        category — shrunk toward the global median (<span id="global-median"></span>) with a prior weight of 3, clamped to
-        0.05–1.50. A category with no token-bearing protocol uses the global median. The multiples
-        are computed from this snapshot, not written in by hand.</p>
-      </div>
-      <div>
-        <h3>Growth &middot; maturity &middot; breadth</h3>
-        <p><strong>Growth</strong> = 1 + 7-day TVL change / 200, clamped to 0.70–1.30.
-        <strong>Maturity</strong> = 1 + 0.4 &times; min(age in days, 730) / 730: a protocol that has
-        run two years with no token scores up to 1.40.
-        <strong>Breadth</strong> = 1 + 0.02 &times; min(chains &minus; 1, 15): more chains, wider reach.</p>
-      </div>
-      <div>
-        <h3>Who is not ranked, and why</h3>
-        <p><span id="excluded-note"></span> A protocol whose token already trades has no launch
-        left to value. A wrapped, staked or bridged product (WBTC is Bitcoin on Ethereum) is not a
-        protocol waiting on a launch of its own. Centralised exchanges and versioned copies are
-        out for the same reason. The board is the 198 protocols that pass that filter.</p>
-      </div>
+<section class="method-bar">
+  <span class="formula">implied value = TVL × category multiple × growth × maturity × breadth × confidence</span>
+  <span class="method-note">Multiples are medians of mcap/TVL per category, winsorized at 3× and shrunk toward the global median (0.214) with prior weight 5 — so one observation never sets a multiple alone.</span>
+  <button id="method-toggle" type="button">Method &amp; multiples ▾</button>
+</section>
+
+<section id="method-panel" class="hidden">
+  <div class="method-cols">
+    <div>
+      <h2>How the value is built</h2>
+      <ul>
+        <li><b>Category multiple</b> — median mcap/TVL of the token-bearing protocols in the category, winsorized at 3×, shrunk toward the global median 0.214 with prior weight 5, clamped 0.05–1.50.</li>
+        <li><b>Growth</b> — 1 + 7-day TVL change, clamped to ±30%. Unreported change counts as 1.00.</li>
+        <li><b>Maturity</b> — 0.85 + 0.15 × min(age in years ÷ 3, 1). Protocols with no listing date count as 0.925.</li>
+        <li><b>Breadth</b> — 1 + 0.05 per extra chain, up to 1.20.</li>
+        <li><b>Confidence</b> — 1.00 when a category has 5+ token observations, 0.97 for 2–4, 0.92 for 1, 0.88 for none. The discount is the model admitting what it does not know.</li>
+      </ul>
+      <p class="caveat">The watchlist is the house rule: TVL ≥ $50M, no token recorded, not a wrapped, staked, bridged, versioned or exchange product. The board holds all 198 genuine candidates in the snapshot — the 40 on the watchlist plus the 158 below the floor. An implied value is this entry's own claim, never a promise that a token launches or what it will trade at.</p>
     </div>
-    <details class="multiples">
-      <summary>Category multiples used (computed from the snapshot)</summary>
-      <table id="mult-table"><thead><tr><th>Category</th><th>Multiple</th></tr></thead><tbody></tbody></table>
-    </details>
-  </section>
+    <div>
+      <h2>Category multiples</h2>
+      <table id="mult-table">
+        <thead><tr><th>Category</th><th>n</th><th>Median</th><th>Multiple</th><th>Confidence</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>
 
-  <section class="controls">
-    <input id="search" type="search" placeholder="Search name or slug…" aria-label="Search protocols">
-    <select id="cat-filter" aria-label="Filter by category"><option value="">All categories</option></select>
-    <label class="toggle"><input type="checkbox" id="watch-only"> Watchlist only (40)</label>
-    <label class="toggle"><input type="checkbox" id="top100"> Top 100</label>
-    <span class="count" id="count"></span>
-  </section>
+<section class="controls">
+  <div class="filters">
+    <button id="f-all" class="filter active" type="button">All · <span id="count-all">198</span></button>
+    <button id="f-watch" class="filter watch" type="button">★ Watchlist only · <span id="count-watch">40</span></button>
+    <button id="f-top" class="filter" type="button">Top 25</button>
+  </div>
+  <input id="search" type="search" placeholder="Search name or slug…" autocomplete="off">
+</section>
 
-  <section class="board-wrap">
-    <table class="board" id="board">
-      <thead>
-        <tr>
-          <th data-sort="rank">#</th>
-          <th data-sort="name">Protocol</th>
-          <th data-sort="category">Category</th>
-          <th data-sort="chains">Chains</th>
-          <th data-sort="tvl_usd" class="num">TVL</th>
-          <th data-sort="change_7d" class="num">7d</th>
-          <th data-sort="age_days" class="num">Age</th>
-          <th data-sort="implied_value_usd" class="num">Implied value</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <section class="detail" id="detail" aria-live="polite">
-    <p class="detail-empty">Click a row to see the protocol’s full value breakdown and its farm plan.</p>
-  </section>
-
-  <footer>
-    <p>Data: DefiLlama protocol snapshot, fetched 2026-11-14 (as-of date in the board header).
-    Implied values are this radar’s own claim from the snapshot’s figures, never a price or a
-    prediction that a token will launch. Farm steps are a plan, not advice: check each protocol’s
-    own terms, fees and risks before you deposit anything.</p>
-  </footer>
+<main>
+  <table id="board">
+    <thead>
+      <tr>
+        <th class="c-rank">#</th>
+        <th class="c-name">Protocol</th>
+        <th class="c-cat">Category</th>
+        <th class="c-tvl">TVL</th>
+        <th class="c-chg">7d</th>
+        <th class="c-val">Implied value</th>
+        <th class="c-mult">Multiple</th>
+        <th class="c-farm">Farm</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p id="empty" class="hidden">No protocol matches this filter.</p>
 </main>
+
+<aside id="detail" class="hidden">
+  <button id="detail-close" type="button" aria-label="Close">✕</button>
+  <h2 id="d-name">—</h2>
+  <p id="d-meta">—</p>
+  <h3>How the value is built</h3>
+  <table id="d-factors">
+    <thead><tr><th>Factor</th><th>Value</th><th>Why</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p id="d-equation">—</p>
+  <h3>Farm plan — 5 steps</h3>
+  <ol id="d-steps"></ol>
+</aside>
+
+<footer>
+  <p>Token Launch Radar · snapshot 2026-11-14 · 198 genuine launch candidates · Implied values are this entry's own claim. A protocol records no token in the snapshot; that is not proof it has none.</p>
+</footer>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
